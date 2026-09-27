@@ -1,3 +1,91 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>航班恢复控制台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#0f766e;color:white;border:0;border-radius:6px}</style>
-<h1>航班恢复控制台</h1><p>查看航班、中断事件与恢复方案。写操作使用 JSON API 并携带 X-User-Id、X-Role。</p><section><input id="u" value="ops"><input id="r" value="ops_manager"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1200px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}
+section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}
+pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}
+input,button{font:inherit;padding:8px;margin:4px}
+button{background:#0f766e;color:white;border:0;border-radius:6px;cursor:pointer}
+button.warn{background:#b45309}
+table{border-collapse:collapse;width:100%;margin-top:10px}
+th,td{border-bottom:1px solid #e5e7eb;padding:6px 8px;text-align:left;font-size:14px;vertical-align:top}
+th{background:#f8fafc}
+.chip{display:inline-block;background:#e0f2f1;color:#0f766e;border-radius:999px;padding:3px 10px;margin:2px;font-size:13px}
+.chip.cancel{background:#fee2e2;color:#b91c1c}
+.chip.pax{background:#e0e7ff;color:#3730a3}
+.muted{color:#6b7280;font-size:13px}
+h2{font-size:18px;margin:4px 0}
+.tag{font-size:12px;border-radius:4px;padding:2px 6px;background:#f1f5f9}
+</style>
+<h1>航班恢复控制台</h1>
+<p>按方案跟踪执行：锁定后生成待通知项，登记通知结果后才能执行或取消；取消项释放飞机和机组，执行中的资源继续占用。</p>
+<section>
+  身份 <input id="u" value="sched"> 角色
+  <select id="r" style="font:inherit;padding:8px;margin:4px">
+    <option value="scheduler" selected>scheduler</option><option value="ops_manager">ops_manager</option>
+    <option value="viewer">viewer</option><option value="auditor">auditor</option>
+  </select>
+  <button onclick="load()">刷新</button>
+  <span class="muted">调度员用 scheduler；viewer/auditor 只读。</span>
+</section>
+<div id="plans"></div>
+<section><h2>原始状态</h2><pre id="o"></pre></section>
+<script>
+const LABEL={pending_notify:'待通知',notified:'已通知',executed:'执行中',cancelled:'已取消'};
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const hdrs=()=>({'X-User-Id':u.value,'X-Role':r.value,'Content-Type':'application/json'});
+async function api(path,body){
+  const x=await fetch(path,{method:'POST',headers:hdrs(),body:JSON.stringify(body||{})});
+  const data=await x.json();
+  if(!x.ok){alert(data.message||data.error||'操作失败');throw new Error(data.error);}
+  return data;
+}
+async function notifyTask(planId,taskId){
+  const note=prompt('登记通知结果（如：机组已确认收到调整）','机组已确认收到调整');
+  if(note===null)return;
+  await api(`/api/plans/${planId}/tasks/${taskId}/notify`,{note});load();
+}
+async function executeTask(planId,taskId){
+  if(!confirm('确认该航班调整已执行？'))return;
+  await api(`/api/plans/${planId}/tasks/${taskId}/execute`);load();
+}
+async function cancelTask(planId,taskId){
+  const reason=prompt('取消原因（必填，将释放原时段飞机和机组）');
+  if(!reason||!reason.trim()){alert('取消原因必填');return;}
+  await api(`/api/plans/${planId}/tasks/${taskId}/cancel`,{reason});load();
+}
+function canAct(){return['scheduler','ops_manager'].includes(r.value);}
+function taskRow(p,t){
+  let actions='';
+  if(canAct()){
+    if(t.status==='pending_notify')actions=`<button onclick="notifyTask(${p.id},${t.id})">登记通知</button>`;
+    else if(t.status==='notified')actions=`<button onclick="executeTask(${p.id},${t.id})">执行</button><button class="warn" onclick="cancelTask(${p.id},${t.id})">取消</button>`;
+  }
+  const detail=t.status==='cancelled'
+    ?`取消：${esc(t.cancel_reason)}<br><span class="muted">${esc(t.cancelled_by)} @ ${esc(t.cancelled_at)}</span>`
+    :t.status==='executed'
+    ?`<span class="muted">${esc(t.executed_by)} @ ${esc(t.executed_at)}</span>`
+    :t.notified_by?`通知：${esc(t.notify_note)}<br><span class="muted">${esc(t.notified_by)} @ ${esc(t.notified_at)}</span>`:'';
+  return`<tr><td>${esc(t.flight_no)}<br><span class="muted">${esc(t.origin)}→${esc(t.destination)}</span></td>
+  <td>${esc(t.new_std)}<br>${esc(t.new_sta)}</td>
+  <td>${esc(t.aircraft_id)} / ${esc(t.crew_id)}</td><td>${t.passenger_count}</td>
+  <td><span class="tag">${LABEL[t.status]||t.status}</span></td><td>${detail}</td><td>${actions}</td></tr>`;
+}
+function planCard(p){
+  const k=p.tracking||{};
+  const chips=`<span class="chip">待通知 ${k.pending_notify||0}</span><span class="chip">已通知 ${k.notified||0}</span>
+  <span class="chip">执行中 ${k.executed||0}</span><span class="chip cancel">已取消 ${k.cancelled||0}</span>
+  <span class="chip pax">受影响旅客 ${k.affected_passengers||0}</span>`+
+  (k.cancelled?`<span class="chip pax">取消影响旅客 ${k.cancelled_passengers}</span>`:'');
+  const rows=(p.tasks||[]).map(t=>taskRow(p,t)).join('');
+  const table=rows?`<table><tr><th>航班</th><th>新时刻</th><th>飞机/机组</th><th>旅客</th><th>状态</th><th>登记信息</th><th>操作</th></tr>${rows}</table>`
+    :'<p class="muted">无执行跟踪项（方案未锁定或无待执行调整）。</p>';
+  return`<section><h2>#${p.id} ${esc(p.name)} <span class="tag">${esc(p.status)}</span></h2><div>${chips}</div>${table}</section>`;
+}
+async function load(){
+  const x=await fetch('/api/state',{headers:hdrs()});
+  const data=await x.json();
+  o.textContent=JSON.stringify(data,null,2);
+  plans.innerHTML=(data.plans||[]).map(planCard).join('')||'<section><p class="muted">暂无恢复方案。</p></section>';
+}
+load();
+</script>

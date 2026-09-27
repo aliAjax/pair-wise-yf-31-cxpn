@@ -95,6 +95,13 @@ class Repository:
                 new_std TEXT NOT NULL, new_sta TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'planned', delay_minutes INTEGER NOT NULL DEFAULT 0,
                 missed_connections INTEGER NOT NULL DEFAULT 0, UNIQUE(plan_id,flight_id)
             );
+            CREATE TABLE IF NOT EXISTS execution_tasks(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES recovery_plans(id) ON DELETE CASCADE,
+                assignment_id INTEGER NOT NULL UNIQUE REFERENCES assignments(id) ON DELETE CASCADE,
+                flight_id INTEGER NOT NULL REFERENCES flights(id), status TEXT NOT NULL DEFAULT 'pending_notify',
+                notify_note TEXT, notified_by TEXT, notified_at TEXT, executed_by TEXT, executed_at TEXT,
+                cancel_reason TEXT, cancelled_by TEXT, cancelled_at TEXT, created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
             """
         )
@@ -349,6 +356,8 @@ class AirlineRecoveryService:
                 conn.execute("UPDATE flights SET std=?,sta=?,aircraft_id=?,crew_id=?,delay_minutes=?,revision=revision+1,updated_at=? WHERE id=?",
                              (row["new_std"], row["new_sta"], row["aircraft_id"], row["crew_id"], max(0, row["delay_minutes"]), iso(), row["flight_id"]))
                 conn.execute("UPDATE assignments SET status='active' WHERE id=?", (row["id"],))
+                conn.execute("INSERT INTO execution_tasks(plan_id,assignment_id,flight_id,created_at) VALUES(?,?,?,?)",
+                             (plan_id, row["id"], row["flight_id"], iso()))
             Repository.audit(conn, plan_id, actor, role, "plan_locked", {"metrics": metrics})
             return self.get_plan(plan_id)
 
@@ -382,15 +391,75 @@ class AirlineRecoveryService:
             Repository.audit(conn, None, actor, role, "flight_recovered", {"flight_id": flight_id})
             return {"flight": dict(conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone())}
 
+    def get_task(self, plan_id: int, task_id: int) -> dict[str, Any]:
+        row = self.repo.conn.execute("""SELECT t.*,f.flight_no,f.passenger_count FROM execution_tasks t JOIN flights f ON f.id=t.flight_id
+                                        WHERE t.id=? AND t.plan_id=?""", (task_id, plan_id)).fetchone()
+        if not row: raise ApiError(404, "task_not_found", "执行跟踪项不存在")
+        return dict(row)
+
+    @staticmethod
+    def _task_or_404(conn: sqlite3.Connection, plan_id: int, task_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM execution_tasks WHERE id=? AND plan_id=?", (task_id, plan_id)).fetchone()
+        if not row: raise ApiError(404, "task_not_found", "执行跟踪项不存在")
+        return row
+
+    def notify_task(self, plan_id: int, task_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "notify_forbidden", "当前角色不能登记通知结果")
+        note = str(body.get("note", "")).strip() or "机组已确认收到调整"
+        with self.repo.tx() as conn:
+            task = self._task_or_404(conn, plan_id, task_id)
+            if task["status"] == "notified": return {"task": self.get_task(plan_id, task_id), "idempotent": True}
+            if task["status"] != "pending_notify": raise ApiError(409, "task_state", "已执行或已取消的项不能登记通知")
+            conn.execute("UPDATE execution_tasks SET status='notified',notify_note=?,notified_by=?,notified_at=? WHERE id=?", (note, actor, iso(), task_id))
+            Repository.audit(conn, plan_id, actor, role, "task_notified", {"task_id": task_id, "flight_id": task["flight_id"], "note": note})
+            return {"task": self.get_task(plan_id, task_id), "idempotent": False}
+
+    def execute_task(self, plan_id: int, task_id: int, actor: str, role: str) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "execute_forbidden", "当前角色不能登记执行")
+        with self.repo.tx() as conn:
+            task = self._task_or_404(conn, plan_id, task_id)
+            if task["status"] == "executed": return {"task": self.get_task(plan_id, task_id), "idempotent": True}
+            if task["status"] == "pending_notify": raise ApiError(409, "notify_required", "登记通知结果后才能执行")
+            if task["status"] != "notified": raise ApiError(409, "task_state", "已取消的项不能执行")
+            conn.execute("UPDATE execution_tasks SET status='executed',executed_by=?,executed_at=? WHERE id=?", (actor, iso(), task_id))
+            Repository.audit(conn, plan_id, actor, role, "task_executed", {"task_id": task_id, "flight_id": task["flight_id"]})
+            return {"task": self.get_task(plan_id, task_id), "idempotent": False}
+
+    def cancel_task(self, plan_id: int, task_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "cancel_forbidden", "当前角色不能取消执行项")
+        reason = str(body.get("reason", "")).strip()
+        if not reason: raise ApiError(400, "reason_required", "取消原因必填")
+        with self.repo.tx() as conn:
+            task = self._task_or_404(conn, plan_id, task_id)
+            if task["status"] == "cancelled": return {"task": self.get_task(plan_id, task_id), "idempotent": True}
+            if task["status"] == "pending_notify": raise ApiError(409, "notify_required", "登记通知结果后才能取消")
+            if task["status"] != "notified": raise ApiError(409, "task_state", "已执行的项不能取消")
+            now = iso()
+            conn.execute("UPDATE execution_tasks SET status='cancelled',cancel_reason=?,cancelled_by=?,cancelled_at=? WHERE id=?", (reason, actor, now, task_id))
+            conn.execute("UPDATE assignments SET status='canceled' WHERE id=?", (task["assignment_id"],))
+            conn.execute("UPDATE flights SET status='canceled',cancel_reason=?,revision=revision+1,updated_at=? WHERE id=?", (reason, now, task["flight_id"]))
+            Repository.audit(conn, plan_id, actor, role, "task_cancelled", {"task_id": task_id, "flight_id": task["flight_id"], "reason": reason})
+            return {"task": self.get_task(plan_id, task_id), "idempotent": False}
+
     def get_plan(self, plan_id: int) -> dict[str, Any]:
         conn = self.repo.conn
         plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
         if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
         assignments = [dict(r) for r in conn.execute("""SELECT a.*,f.flight_no,f.origin,f.destination,f.passenger_count FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=? ORDER BY a.new_std""", (plan_id,))]
+        tasks = [dict(r) for r in conn.execute("""SELECT t.*,f.flight_no,f.origin,f.destination,f.passenger_count,a.new_std,a.new_sta,a.aircraft_id,a.crew_id
+                                                  FROM execution_tasks t JOIN flights f ON f.id=t.flight_id JOIN assignments a ON a.id=t.assignment_id
+                                                  WHERE t.plan_id=? ORDER BY a.new_std""", (plan_id,))]
+        tracking = {"pending_notify": 0, "notified": 0, "executed": 0, "cancelled": 0, "affected_passengers": 0, "cancelled_passengers": 0}
+        for task in tasks:
+            tracking[task["status"]] += 1
+            tracking["affected_passengers"] += task["passenger_count"]
+            if task["status"] == "cancelled": tracking["cancelled_passengers"] += task["passenger_count"]
         result = dict(plan)
         result["metrics"] = json.loads(plan["metrics_json"]) if plan["metrics_json"] else self._metrics(conn, plan_id)
         result["score"] = json.loads(plan["score_json"]) if plan["score_json"] else None
         result["assignments"] = assignments
+        result["tasks"] = tasks
+        result["tracking"] = tracking
         return result
 
     def compare_plans(self, disruption_id: int) -> dict[str, Any]:
@@ -454,6 +523,11 @@ class Handler(BaseHTTPRequestHandler):
             if action == "assignments": return 200, self.service.add_assignment(plan_id, actor, role, body)
             if action == "validate": return 200, self.service.validate_plan(plan_id, actor, role)
             if action == "lock": return 200, self.service.lock_plan(plan_id, actor, role, body)
+        if len(parts) == 6 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "tasks" and parts[4].isdigit():
+            plan_id, task_id, action = int(parts[2]), int(parts[4]), parts[5]
+            if action == "notify": return 200, self.service.notify_task(plan_id, task_id, actor, role, body)
+            if action == "execute": return 200, self.service.execute_task(plan_id, task_id, actor, role)
+            if action == "cancel": return 200, self.service.cancel_task(plan_id, task_id, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "flights"] and parts[2].isdigit():
             flight_id, action = int(parts[2]), parts[3]
             if action == "cancel": return 200, self.service.cancel_flight(flight_id, actor, role, body)

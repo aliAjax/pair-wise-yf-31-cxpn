@@ -53,6 +53,65 @@ class AirlineFlowTest(unittest.TestCase):
         with self.assertRaises(ApiError) as ctx:
             self.svc.add_assignment(plan1["id"], "sched", "scheduler", {"expected_revision": 1, "flight_id": flight1["id"], "aircraft_id": "AC1", "crew_id": "CR1", "new_std": iso(self.base), "new_sta": iso(self.base + timedelta(hours=2))})
         self.assertEqual(ctx.exception.code, "plan_locked")
+    def test_execution_tracking_lifecycle(self):
+        flight = self.make_flight("AB200", "AC1", "CR1")
+        disruption = self.svc.create_disruption("sched", "scheduler", {"kind": "aircraft_fault", "resource_id": "AC1", "starts_at": iso(self.base - timedelta(hours=1)), "ends_at": iso(self.base + timedelta(hours=3))})
+        plan = self.svc.create_plan("sched", "scheduler", {"disruption_id": disruption["id"], "name": "跟踪方案", "assignments": [{"flight_id": flight["id"], "aircraft_id": "AC2", "crew_id": "CR2", "new_std": iso(self.base + timedelta(hours=3)), "new_sta": iso(self.base + timedelta(hours=5))}]})
+        locked = self.svc.lock_plan(plan["id"], "ops", "ops_manager", {"expected_revision": 1})
+        self.assertEqual(locked["tracking"]["pending_notify"], 1)
+        self.assertEqual(locked["tracking"]["affected_passengers"], 150)
+        task = locked["tasks"][0]
+        self.assertEqual(task["status"], "pending_notify")
+        with self.assertRaises(ApiError) as ctx:
+            self.svc.execute_task(plan["id"], task["id"], "sched", "scheduler")
+        self.assertEqual(ctx.exception.code, "notify_required")
+        with self.assertRaises(ApiError) as ctx:
+            self.svc.cancel_task(plan["id"], task["id"], "sched", "scheduler", {"reason": "机组超时"})
+        self.assertEqual(ctx.exception.code, "notify_required")
+        with self.assertRaises(ApiError) as ctx:
+            self.svc.notify_task(plan["id"], task["id"], "view", "viewer", {})
+        self.assertEqual(ctx.exception.status, 403)
+        notified = self.svc.notify_task(plan["id"], task["id"], "sched", "scheduler", {"note": "机组已确认"})["task"]
+        self.assertEqual(notified["status"], "notified")
+        self.assertEqual(notified["notified_by"], "sched")
+        self.assertTrue(self.svc.notify_task(plan["id"], task["id"], "sched", "scheduler", {})["idempotent"])
+        executed = self.svc.execute_task(plan["id"], task["id"], "sched", "scheduler")["task"]
+        self.assertEqual(executed["status"], "executed")
+        self.assertEqual(executed["executed_by"], "sched")
+        with self.assertRaises(ApiError) as ctx:
+            self.svc.cancel_task(plan["id"], task["id"], "sched", "scheduler", {"reason": "太晚"})
+        self.assertEqual(ctx.exception.code, "task_state")
+        tracking = self.svc.get_plan(plan["id"])["tracking"]
+        self.assertEqual((tracking["pending_notify"], tracking["executed"], tracking["cancelled"]), (0, 1, 0))
+
+    def test_cancel_releases_resources_and_records_operator(self):
+        flight1 = self.make_flight("AB300", "AC1", "CR1")
+        disruption1 = self.svc.create_disruption("sched", "scheduler", {"kind": "aircraft_fault", "resource_id": "AC1", "starts_at": iso(self.base), "ends_at": iso(self.base + timedelta(hours=2))})
+        plan1 = self.svc.create_plan("sched", "scheduler", {"disruption_id": disruption1["id"], "name": "占用方案", "assignments": [{"flight_id": flight1["id"], "aircraft_id": "AC2", "crew_id": "CR2", "new_std": iso(self.base + timedelta(hours=2)), "new_sta": iso(self.base + timedelta(hours=4))}]})
+        task = self.svc.lock_plan(plan1["id"], "ops", "ops_manager", {"expected_revision": 1})["tasks"][0]
+        flight2 = self.make_flight("AB301", "AC2", "CR2")
+        disruption2 = self.svc.create_disruption("sched", "scheduler", {"kind": "airport_closure", "resource_id": "AAA", "starts_at": iso(self.base), "ends_at": iso(self.base + timedelta(hours=1))})
+        plan2 = self.svc.create_plan("sched", "scheduler", {"disruption_id": disruption2["id"], "name": "接手方案", "assignments": [{"flight_id": flight2["id"], "aircraft_id": "AC2", "crew_id": "CR2", "new_std": iso(self.base + timedelta(hours=2, minutes=30)), "new_sta": iso(self.base + timedelta(hours=4, minutes=30))}]})
+        self.svc.notify_task(plan1["id"], task["id"], "sched", "scheduler", {"note": "已通知机组"})
+        with self.assertRaises(ApiError) as ctx:
+            self.svc.lock_plan(plan2["id"], "ops", "ops_manager", {"expected_revision": 1})
+        self.assertEqual(ctx.exception.code, "locked_resource_conflict")
+        with self.assertRaises(ApiError) as ctx:
+            self.svc.cancel_task(plan1["id"], task["id"], "sched", "scheduler", {"reason": "  "})
+        self.assertEqual(ctx.exception.code, "reason_required")
+        cancelled = self.svc.cancel_task(plan1["id"], task["id"], "sched", "scheduler", {"reason": "机组超时无法执行"})["task"]
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["cancelled_by"], "sched")
+        self.assertEqual(cancelled["cancel_reason"], "机组超时无法执行")
+        self.assertTrue(self.svc.cancel_task(plan1["id"], task["id"], "sched", "scheduler", {"reason": "机组超时无法执行"})["idempotent"])
+        flight1_now = [f for f in self.svc.state()["flights"] if f["id"] == flight1["id"]][0]
+        self.assertEqual(flight1_now["status"], "canceled")
+        self.assertEqual(flight1_now["cancel_reason"], "机组超时无法执行")
+        locked2 = self.svc.lock_plan(plan2["id"], "ops", "ops_manager", {"expected_revision": 1})
+        self.assertEqual(locked2["status"], "locked")
+        tracking = self.svc.get_plan(plan1["id"])["tracking"]
+        self.assertEqual(tracking["cancelled"], 1)
+        self.assertEqual(tracking["cancelled_passengers"], 150)
 
 
 if __name__ == "__main__": unittest.main()

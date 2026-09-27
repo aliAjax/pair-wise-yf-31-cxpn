@@ -18,10 +18,11 @@ python3 app.py --db airline_recovery.db
 - `POST /api/flights`、`POST /api/disruptions`：创建航班和中断。
 - `POST /api/recovery-plans`：一次提交方案及航班调整。
 - `POST /api/plans/{id}/assignments`：用 `expected_revision` 临时改派。
-- `POST /api/plans/{id}/validate`、`/lock`：校验并原子锁定方案。
+- `POST /api/plans/{id}/validate`、`/lock`：校验并原子锁定方案；锁定时为每个待执行调整生成执行跟踪项（待通知）。
+- `POST /api/plans/{id}/tasks/{task_id}/notify`、`/execute`、`/cancel`：调度员逐项登记通知结果；通知后才能执行或取消；取消必须填原因，自动记录操作人并释放原时段飞机和机组（执行中的资源继续占用，新方案锁定冲突校验仍生效）。
 - `GET /api/disruptions/{id}/compare`：比较恢复方案成本。
 - `POST /api/flights/{id}/cancel`、`/recover`：取消和人工恢复。
-- `GET /api/state`、`GET /api/plans/{id}`：查询状态和影响。
+- `GET /api/state`、`GET /api/plans/{id}`：查询状态和影响；方案详情含 `tasks` 明细和 `tracking` 汇总（待通知、已通知、执行中、已取消、受影响旅客）。
 
 ## 测试
 
