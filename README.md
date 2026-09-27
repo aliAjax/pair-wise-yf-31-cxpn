@@ -18,7 +18,8 @@ python3 app.py --db airline_recovery.db
 - `POST /api/flights`、`POST /api/disruptions`：创建航班和中断。
 - `POST /api/recovery-plans`：一次提交方案及航班调整。
 - `POST /api/plans/{id}/assignments`：用 `expected_revision` 临时改派。
-- `POST /api/plans/{id}/validate`、`/lock`：校验并原子锁定方案。
+- `POST /api/plans/{id}/validate`、`/lock`：校验并原子锁定方案；锁定时为每个航班调整生成“待通知”执行项。
+- `POST /api/execution-items/{id}/notify|execute|complete|cancel`：逐项登记机组通知结果、开始执行、完成、临时取消；必须先通知才能执行或取消，取消必填原因并记录操作人，取消后释放原时段飞机和机组。
 - `GET /api/disruptions/{id}/compare`：比较恢复方案成本。
 - `POST /api/flights/{id}/cancel`、`/recover`：取消和人工恢复。
 - `GET /api/state`、`GET /api/plans/{id}`：查询状态和影响。

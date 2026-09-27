@@ -96,8 +96,38 @@ class Repository:
                 missed_connections INTEGER NOT NULL DEFAULT 0, UNIQUE(plan_id,flight_id)
             );
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS execution_items(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_id INTEGER NOT NULL REFERENCES recovery_plans(id) ON DELETE CASCADE,
+                assignment_id INTEGER NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+                flight_id INTEGER NOT NULL REFERENCES flights(id),
+                status TEXT NOT NULL DEFAULT 'pending',
+                notify_result TEXT, notify_detail TEXT, notified_by TEXT, notified_at TEXT,
+                executed_by TEXT, executed_at TEXT,
+                completed_by TEXT, completed_at TEXT,
+                canceled_by TEXT, canceled_at TEXT, cancel_reason TEXT,
+                created_at TEXT NOT NULL, UNIQUE(assignment_id)
+            );
             """
         )
+        self._backfill_legacy_items()
+
+    def _backfill_legacy_items(self) -> None:
+        """历史锁定方案没有执行跟踪项：按锁定即生效的旧语义补建。"""
+        now = iso()
+        rows = self.conn.execute("""SELECT a.id,a.plan_id,a.flight_id,a.status FROM assignments a
+            JOIN recovery_plans p ON p.id=a.plan_id
+            WHERE p.status='locked' AND NOT EXISTS (SELECT 1 FROM execution_items e WHERE e.assignment_id=a.id)""").fetchall()
+        for row in rows:
+            if row["status"] == "canceled":
+                self.conn.execute("""INSERT INTO execution_items(plan_id,assignment_id,flight_id,status,created_at,canceled_at,canceled_by,cancel_reason)
+                    VALUES(?,?,?,?,?,?,?,?)""",
+                    (row["plan_id"], row["id"], row["flight_id"], "canceled", now, now, "system", "历史锁定数据迁移"))
+            else:
+                self.conn.execute("""INSERT INTO execution_items(plan_id,assignment_id,flight_id,status,created_at,
+                    notified_at,notified_by,notify_result,executed_at,executed_by,completed_at,completed_by)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (row["plan_id"], row["id"], row["flight_id"], "completed", now, now, "system", "历史锁定数据迁移", now, "system", now, "system"))
 
     @staticmethod
     def audit(conn: sqlite3.Connection, plan_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -345,10 +375,14 @@ class AirlineRecoveryService:
             metrics = self._metrics(conn, plan_id)
             conn.execute("""UPDATE recovery_plans SET status='locked',metrics_json=?,score_json=?,locked_at=?,locked_by=? WHERE id=?""",
                          (json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), iso(), actor, plan_id))
-            for row in conn.execute("""SELECT a.*,f.flight_no FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=? AND a.status!='canceled'""", (plan_id,)):
-                conn.execute("UPDATE flights SET std=?,sta=?,aircraft_id=?,crew_id=?,delay_minutes=?,revision=revision+1,updated_at=? WHERE id=?",
-                             (row["new_std"], row["new_sta"], row["aircraft_id"], row["crew_id"], max(0, row["delay_minutes"]), iso(), row["flight_id"]))
-                conn.execute("UPDATE assignments SET status='active' WHERE id=?", (row["id"],))
+            for row in conn.execute("""SELECT a.*,f.flight_no FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=?""", (plan_id,)):
+                if row["status"] != "canceled":
+                    conn.execute("UPDATE flights SET std=?,sta=?,aircraft_id=?,crew_id=?,delay_minutes=?,revision=revision+1,updated_at=? WHERE id=?",
+                                 (row["new_std"], row["new_sta"], row["aircraft_id"], row["crew_id"], max(0, row["delay_minutes"]), iso(), row["flight_id"]))
+                    conn.execute("UPDATE assignments SET status='active' WHERE id=?", (row["id"],))
+                conn.execute("""INSERT INTO execution_items(plan_id,assignment_id,flight_id,status,created_at)
+                                VALUES(?,?,?,?,?)""",
+                             (plan_id, row["id"], row["flight_id"], "pending", iso()))
             Repository.audit(conn, plan_id, actor, role, "plan_locked", {"metrics": metrics})
             return self.get_plan(plan_id)
 
@@ -382,6 +416,68 @@ class AirlineRecoveryService:
             Repository.audit(conn, None, actor, role, "flight_recovered", {"flight_id": flight_id})
             return {"flight": dict(conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone())}
 
+    def _load_locked_item(self, conn: sqlite3.Connection, item_id: int) -> sqlite3.Row:
+        row = conn.execute("""SELECT e.*,p.status plan_status FROM execution_items e
+                              JOIN recovery_plans p ON p.id=e.plan_id WHERE e.id=?""", (item_id,)).fetchone()
+        if not row: raise ApiError(404, "item_not_found", "执行跟踪项不存在")
+        if row["plan_status"] != "locked": raise ApiError(409, "plan_not_locked", "方案未锁定，无法登记执行")
+        return row
+
+    def notify_item(self, item_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "notify_forbidden", "当前角色不能登记机组通知")
+        result = str(body.get("notify_result", "")).strip()
+        if result not in {"notified", "failed", "no_answer", "refused"}:
+            raise ApiError(400, "invalid_notify_result", "notify_result 必须是 notified/failed/no_answer/refused")
+        detail = str(body.get("notify_detail", "")).strip() or None
+        with self.repo.tx() as conn:
+            item = self._load_locked_item(conn, item_id)
+            if item["status"] != "pending": raise ApiError(409, "item_state", f"当前状态 {item['status']} 不能登记通知")
+            conn.execute("""UPDATE execution_items SET status='notified',notify_result=?,notify_detail=?,notified_by=?,notified_at=? WHERE id=?""",
+                         (result, detail, actor, iso(), item_id))
+            Repository.audit(conn, item["plan_id"], actor, role, "crew_notified", {"item_id": item_id, "notify_result": result})
+            return self.get_plan(item["plan_id"])
+
+    def execute_item(self, item_id: int, actor: str, role: str) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "execute_forbidden", "当前角色不能登记执行")
+        with self.repo.tx() as conn:
+            item = self._load_locked_item(conn, item_id)
+            assignment = conn.execute("SELECT status FROM assignments WHERE id=?", (item["assignment_id"],)).fetchone()
+            if assignment["status"] == "canceled": raise ApiError(409, "item_canceled", "该项已取消，不能执行")
+            if item["status"] == "pending": raise ApiError(409, "crew_not_notified", "必须先登记机组通知结果")
+            if item["status"] != "notified": raise ApiError(409, "item_state", f"当前状态 {item['status']} 不能执行")
+            conn.execute("UPDATE execution_items SET status='executing',executed_by=?,executed_at=? WHERE id=?", (actor, iso(), item_id))
+            Repository.audit(conn, item["plan_id"], actor, role, "item_executed", {"item_id": item_id})
+            return self.get_plan(item["plan_id"])
+
+    def complete_item(self, item_id: int, actor: str, role: str) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "complete_forbidden", "当前角色不能登记完成")
+        with self.repo.tx() as conn:
+            item = self._load_locked_item(conn, item_id)
+            if item["status"] != "executing": raise ApiError(409, "item_state", f"当前状态 {item['status']} 不能登记完成")
+            conn.execute("UPDATE execution_items SET status='completed',completed_by=?,completed_at=? WHERE id=?", (actor, iso(), item_id))
+            Repository.audit(conn, item["plan_id"], actor, role, "item_completed", {"item_id": item_id})
+            return self.get_plan(item["plan_id"])
+
+    def cancel_item(self, item_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "cancel_item_forbidden", "当前角色不能取消执行项")
+        reason = str(body.get("reason", "")).strip()
+        if not reason: raise ApiError(400, "reason_required", "取消原因必填")
+        with self.repo.tx() as conn:
+            item = self._load_locked_item(conn, item_id)
+            if item["status"] in {"pending"}: raise ApiError(409, "crew_not_notified", "必须先登记机组通知结果再取消")
+            if item["status"] == "canceled": raise ApiError(409, "item_state", "该项已经取消")
+            if item["status"] == "completed": raise ApiError(409, "item_completed", "已完成项不能取消")
+            conn.execute("""UPDATE execution_items SET status='canceled',canceled_by=?,canceled_at=?,cancel_reason=? WHERE id=?""",
+                         (actor, iso(), reason, item_id))
+            conn.execute("UPDATE assignments SET status='canceled' WHERE id=?", (item["assignment_id"],))
+            flight = conn.execute("SELECT status FROM flights WHERE id=?", (item["flight_id"],)).fetchone()
+            if flight and flight["status"] != "canceled":
+                conn.execute("UPDATE flights SET status='canceled',cancel_reason=?,revision=revision+1,updated_at=? WHERE id=?",
+                             (reason, iso(), item["flight_id"]))
+            Repository.audit(conn, item["plan_id"], actor, role, "item_canceled",
+                             {"item_id": item_id, "flight_id": item["flight_id"], "reason": reason, "from_status": item["status"]})
+            return self.get_plan(item["plan_id"])
+
     def get_plan(self, plan_id: int) -> dict[str, Any]:
         conn = self.repo.conn
         plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
@@ -391,7 +487,29 @@ class AirlineRecoveryService:
         result["metrics"] = json.loads(plan["metrics_json"]) if plan["metrics_json"] else self._metrics(conn, plan_id)
         result["score"] = json.loads(plan["score_json"]) if plan["score_json"] else None
         result["assignments"] = assignments
+        result["execution_items"] = self._execution_items(conn, plan_id)
+        result["execution_summary"] = self._execution_summary(conn, plan_id)
         return result
+
+    def _execution_items(self, conn: sqlite3.Connection, plan_id: int) -> list[dict[str, Any]]:
+        rows = conn.execute("""SELECT e.*,f.flight_no,f.origin,f.destination,f.passenger_count,a.aircraft_id,a.crew_id,
+                                      a.new_std,a.new_sta,a.status assignment_status
+                               FROM execution_items e
+                               JOIN flights f ON f.id=e.flight_id
+                               JOIN assignments a ON a.id=e.assignment_id
+                               WHERE e.plan_id=? ORDER BY a.new_std""", (plan_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def _execution_summary(self, conn: sqlite3.Connection, plan_id: int) -> dict[str, Any]:
+        items = self._execution_items(conn, plan_id)
+        counts = {"pending": 0, "notified": 0, "executing": 0, "completed": 0, "canceled": 0}
+        passengers = dict(counts)
+        for item in items:
+            counts[item["status"]] += 1
+            passengers[item["status"]] += item["passenger_count"]
+        return {"total": len(items), "counts": counts,
+                "affected_passengers": sum(item["passenger_count"] for item in items),
+                "passengers_by_status": passengers}
 
     def compare_plans(self, disruption_id: int) -> dict[str, Any]:
         plans = []
@@ -458,6 +576,12 @@ class Handler(BaseHTTPRequestHandler):
             flight_id, action = int(parts[2]), parts[3]
             if action == "cancel": return 200, self.service.cancel_flight(flight_id, actor, role, body)
             if action == "recover": return 200, self.service.recover_flight(flight_id, actor, role, body)
+        if len(parts) == 4 and parts[:2] == ["api", "execution-items"] and parts[2].isdigit():
+            item_id, action = int(parts[2]), parts[3]
+            if action == "notify": return 200, self.service.notify_item(item_id, actor, role, body)
+            if action == "execute": return 200, self.service.execute_item(item_id, actor, role)
+            if action == "complete": return 200, self.service.complete_item(item_id, actor, role)
+            if action == "cancel": return 200, self.service.cancel_item(item_id, actor, role, body)
         raise ApiError(404, "not_found", "接口不存在")
     def handle_request(self, method: str) -> None:
         parsed = urlparse(self.path)
